@@ -2,7 +2,7 @@
 
 Hub dokumentasi untuk project Sistem PoS. Ditulis agar mudah dicerna developer maupun AI agent.
 
-**Stack:** <!-- ISI: tech stack singkat, mis. Go 1.23 · React 19 · PostgreSQL · Redis -->
+**Stack:** PHP 8.3 · Laravel 12 · Filament 4 · Inertia 2 + React 19 + TypeScript · PostgreSQL 16 · Redis 7
 
 ## Mulai dari sini
 

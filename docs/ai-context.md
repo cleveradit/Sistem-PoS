@@ -8,36 +8,144 @@ All AI agents MUST read and follow these rules before proposing or implementing 
 
 ## 1. Tech Stack (STRICT — no deviations)
 
-<!-- ISI DI SINI: daftar bahasa, framework, library utama, dan constraint versi yang TIDAK BOLEH dilanggar. Contoh: Go 1.23, React 19, PostgreSQL 16, Redis 7. -->
+Sumber: [initiate-file/02-architecture.md](initiate-file/02-architecture.md) §2. Perubahan stack wajib lewat entry baru di [decision-log.md](decision-log.md).
+
+| Lapisan | Pilihan | Constraint |
+|---|---|---|
+| Bahasa & framework | PHP 8.3, Laravel 12 | Versi minor boleh naik, major tidak |
+| Back office / panel admin | Filament 4 | CRUD master data, pengaturan, panel Super Admin |
+| Terminal kasir | Inertia 2 + React 19 + TypeScript + shadcn/ui, dibungkus PWA | Bukan Livewire — kebutuhan offline & state kompleks |
+| Basis data | PostgreSQL 16 | Bukan MySQL. JSONB, partial index, pg_trgm, dan RLS dipakai dan tidak opsional |
+| Cache, sesi, antrean | Redis 7 + Laravel Horizon | — |
+| Realtime | Laravel Reverb (WebSocket) | KDS, 86 list, status meja |
+| Penyimpanan berkas | S3 compatible (MinIO / Cloudflare R2) | — |
+| Pencarian | PostgreSQL `pg_trgm` | Meilisearch hanya jika katalog > 50.000 item |
+| Penyimpanan lokal terminal | IndexedDB via Dexie + Service Worker (Workbox) | Master data & outbox offline |
+| Pencetakan | Print Agent lokal (Go, single binary), fallback WebUSB / Web Bluetooth | Hanya ESC/POS standar |
+| Kontainerisasi | Docker + Docker Compose | — |
+| CI/CD | GitHub Actions | — |
+| Reverse proxy | Traefik atau Nginx Proxy Manager | Routing subdomain tenant |
+| Observability | Sentry, Laravel Pulse | — |
+
+**Sudah ditolak, jangan diusulkan ulang:** MySQL 8, microservices sejak awal, Livewire untuk layar kasir.
 
 ---
 
 ## 2. Architecture Mandates
 
-<!-- ISI DI SINI: aturan arsitektur absolut. Contoh: "All domain logic lives in internal/. Nothing domain-related in cmd/." -->
-<!-- Contoh: "Cross-module reads are allowed. Cross-module writes are forbidden — call the owning module's Service instead." -->
+Sepuluh prinsip berikut bersifat absolut. Kode yang melanggar ditolak di review, bukan didiskusikan.
+
+| Kode | Mandat | Konsekuensi konkret |
+|---|---|---|
+| AP-01 | **Modular monolith** | Satu deployable. Microservice hanya jika terbukti perlu |
+| AP-02 | **Tenant isolation by default** | Tidak ada query tanpa scope tenant. Pelanggaran ditolak di test |
+| AP-03 | **Ledger sebagai sumber kebenaran** | Stok dan kas direkonstruksi dari mutasi, bukan angka yang di-UPDATE |
+| AP-04 | **Transaksi immutable** | Tidak ada UPDATE pada baris penjualan final. Koreksi lewat dokumen pembalik |
+| AP-05 | **Snapshot pada titik transaksi** | Harga, nama, HPP, pajak disalin ke baris transaksi |
+| AP-06 | **Offline first di terminal** | Kasir menulis ke lokal dulu, sinkronisasi menyusul |
+| AP-07 | **Idempotensi di seluruh jalur tulis** | Setiap operasi tulis membawa kunci idempotensi dari klien |
+| AP-08 | **Feature flag ditegakkan di server** | UI menyembunyikan, server menolak. Tidak pernah hanya UI |
+| AP-09 | **Baca berat dipisah dari tulis** | Laporan memakai read model teragregasi |
+| AP-10 | **Aksi sensitif meninggalkan jejak** | Audit log adalah kebutuhan produk, bukan sekadar teknis |
+
+### 2.1 Struktur kode
+
+`app/Core/` adalah shared kernel — **tidak boleh bergantung pada modul mana pun**. Isinya: `Money/`, `Tenancy/`, `Modules/`, `Sequencing/`, `Auditing/`, `Idempotency/`, `Support/`.
+
+Setiap modul di `modules/{Nama}/` memakai empat lapis tetap: `Domain/` (entity, VO, event, interface repository) → `Application/` (command, query, DTO) → `Infrastructure/` (Eloquent, migration, provider) → `Presentation/` (Http, Filament, routes).
+
+Daftar modul: Identity, Tenancy, Catalog, Inventory, Sales, Payment, Shift, Fnb, Service, Customer, Promotion, Purchasing, Employee, Expense, Reporting, Billing, Platform.
+
+### 2.2 Ketergantungan antar modul
+
+Modul **tidak boleh** memanggil model Eloquent modul lain secara langsung. Komunikasi lintas modul hanya lewat tiga jalur: **domain event**, **application service publik**, atau **read model bersama**.
+
+Arah yang diizinkan (searah, tanpa siklus):
+
+```
+Sales      ──▶ Catalog, Inventory, Customer, Promotion, Payment, Shift, Tenancy
+Fnb        ──▶ Sales, Catalog
+Service    ──▶ Sales, Customer, Employee
+Inventory  ──▶ Catalog, Tenancy
+Purchasing ──▶ Inventory, Catalog
+Billing    ──▶ Tenancy
+Reporting  ──▶ (baca read model saja; tidak ada modul yang bergantung padanya)
+Semua      ──▶ Core, Identity, Tenancy
+```
+
+Ditegakkan otomatis lewat Deptrac/PHPArkitect di CI. Pelanggaran menggagalkan build.
+
+### 2.3 Multi-tenancy
+
+Single database, shared schema, kolom `tenant_id` + `business_id` di seluruh tabel transaksional. Pertahanan berlapis: middleware `ResolveTenant` → trait `BelongsToTenant` (global scope + auto-fill) → PostgreSQL RLS via `SET LOCAL app.tenant_id` → uji kebocoran dua tenant per endpoint → prefix cache `t:{tenant_id}:b:{business_id}:`.
+
+Urutan middleware baku: `ResolveTenant` → `EnsureSubscriptionActive` → `ModuleGate` → `Permission` → Controller.
+
+Koneksi database selalu lewat `TenantConnectionResolver`, meski v1 selalu mengembalikan koneksi yang sama.
+
+### 2.4 Feature flag
+
+Penegakan wajib di lima titik: middleware route `module:fnb.table`, `canAccess()` pada Filament Resource, middleware API (balas `403 MODULE_DISABLED`), render bersyarat via prop `enabledModules`, dan guard di awal job/listener — karena flag bisa berubah setelah job diantrekan.
+
+Cache di Redis pada kunci `t:{tenant}:b:{business}:modules` **tanpa TTL**; invalidasi eksplisit saat event `BusinessModuleChanged`.
+
+### 2.5 Perhitungan total
+
+Urutan 11 langkah (subtotal item → modifier → diskon item → subtotal → diskon transaksi → dasar pengenaan → service charge → pajak → total sebelum bulat → pembulatan → grand total) dikodekan **hanya** di kelas `PricingEngine`. Klien memakai port TypeScript-nya. Duplikasi logika diterima demi offline, tetapi kesetaraan diverifikasi lewat golden test dataset yang sama di kedua sisi. Detail: [initiate-file/02-architecture.md](initiate-file/02-architecture.md) §9.2.
+
+### 2.6 Penomoran dokumen
+
+Format `{PREFIX}-{KODE_TERMINAL}-{YYMMDD}-{URUT}` (mis. `INV-K01-260810-0042`), dihasilkan **di klien** agar tahan offline; server hanya memverifikasi keunikan `terminal_id + document_number`. Dokumen sisi server (PO, transfer stok) memakai tabel `document_sequences` dengan `SELECT ... FOR UPDATE`. Kunci teknis tetap `uuid` v7 — `document_number` hanya untuk manusia.
 
 ---
 
 ## 3. Rules
 
-<!-- ISI DI SINI: aturan teknis yang harus dipatuhi setiap AI agent. Format: Rule N — judul singkat, lalu 1-3 kalimat penjelasan. -->
-<!-- Contoh:
-**Rule 1 — Naming Convention:** All service files MUST be suffixed with `_service.go`.
-**Rule 2 — Error Handling:** Never panic; always return wrapped errors with context.
--->
+**Rule 1 — Tenant scope tidak pernah implisit di job.** `TenantContext` adalah singleton per request dan **tidak** diwarisi job antrean. Setiap job wajib membawa `tenant_id` eksplisit di payload dan memanggil `TenantContext::set()` di awal `handle()`. Turunkan dari base class `TenantAwareJob`. Ini kesalahan paling umum di aplikasi multi-tenant.
+
+**Rule 2 — Dilarang menyentuh Eloquent modul lain.** Butuh data modul tetangga? Pakai application service publiknya, dengarkan domain event-nya, atau baca read model. Jangan `use Modules\Catalog\Infrastructure\Eloquent\Product` dari dalam `modules/Sales/`.
+
+**Rule 3 — Setiap endpoint tulis menerima `Idempotency-Key`.** Respons diulang dari cache selama 24 jam untuk kunci yang sama. Endpoint tulis tanpa penanganan kunci ini dianggap belum selesai.
+
+**Rule 4 — Jangan pernah UPDATE transaksi final.** Void, retur, dan koreksi dibuat sebagai dokumen baru yang membalik. Stok dan kas dibaca dengan menjumlahkan ledger, bukan dari kolom counter.
+
+**Rule 5 — Snapshot, bukan join, untuk data historis.** Harga, nama produk, HPP, dan tarif pajak disalin ke baris transaksi saat dibuat. Laporan periode lampau tidak boleh berubah ketika master data diubah.
+
+**Rule 6 — Feature flag dicek di server.** Menyembunyikan tombol di React bukan implementasi. Route/API/Filament/job harus menolak dengan `403 MODULE_DISABLED`.
+
+**Rule 7 — Raw query dilarang tanpa review.** Pakai query builder atau prepared statement. Setiap endpoint yang menerima ID wajib punya policy per model plus uji IDOR.
+
+**Rule 8 — Format error API konsisten:** `{"error": {"code", "message", "details"}}`. `code` berupa konstanta SCREAMING_SNAKE, `message` bahasa Indonesia untuk pengguna akhir.
+
+**Rule 9 — Paginasi memakai cursor, bukan offset,** untuk daftar yang sering berubah. Versi API ada di path (`/api/pos/v1`), bukan di header.
+
+**Rule 10 — Migrasi expand lalu contract.** Kolom baru ditambahkan nullable, kode ditulis kompatibel dua arah, kolom lama dihapus di rilis berikutnya. Tidak ada migrasi destruktif dalam satu deploy.
+
+**Rule 11 — Uji isolasi tenant wajib.** Setiap endpoint baru butuh test yang membuat dua tenant dan memverifikasi tidak ada kebocoran. Test ini tidak boleh di-skip.
+
+**Rule 12 — Aksi sensitif wajib tercatat.** Perubahan feature flag, void, diskon manual, override supervisor, impersonasi, dan penyesuaian stok masuk audit log lengkap dengan pelaku, waktu, dan alasan.
+
+**Rule 13 — Rahasia hanya di environment variable.** Tidak pernah masuk repositori. Nomor kartu disimpan maksimal 4 digit terakhir + nomor referensi; tidak pernah PAN penuh atau CVV.
+
+**Rule 14 — Gate CI yang harus lulus:** Pint, ESLint, TypeScript check, PHPStan level 6, Deptrac batas modul, unit + feature test termasuk uji isolasi tenant.
 
 ---
 
 ## 4. Local Development Environment
 
-<!-- ISI DI SINI: cara menjalankan project di local. Sertakan:
-- Prasyarat (Docker, Go version, Node version, dll.)
-- Cara start services
-- Cara rebuild
-- Cara clear cache
-- Catatan penting (mount, hot reload, dll.)
--->
+**Status: belum berlaku.** Repositori ini baru berisi dokumentasi — belum ada kode aplikasi, `composer.json`, maupun `docker-compose.yml`. Section ini diisi dengan perintah nyata setelah ticket scaffolding selesai; jangan menuliskan perintah yang belum pernah dijalankan.
+
+Prasyarat yang sudah pasti dari stack di atas:
+
+| Kebutuhan | Versi |
+|---|---|
+| Docker + Docker Compose | terbaru |
+| PHP | 8.3 |
+| Node.js | LTS aktif (untuk Vite + React 19) |
+| PostgreSQL | 16 (via container) |
+| Redis | 7 (via container) |
+
+Lingkungan yang direncanakan: `local` (Docker Compose, data seeder) · `staging` (salinan anonim produksi) · `production`.
 
 ---
 
